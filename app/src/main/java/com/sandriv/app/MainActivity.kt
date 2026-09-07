@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.view.View
+import android.view.MotionEvent
 import android.view.inputmethod.EditorInfo
 import android.widget.TextView
 import android.widget.Toast
@@ -54,6 +55,9 @@ class MainActivity : AppCompatActivity(), LocationListener {
     private lateinit var speedText: TextView
     private lateinit var startButton: MaterialButton
     private lateinit var stopButton: MaterialButton
+    private lateinit var originText: TextView
+    private lateinit var tripStatsText: TextView
+    private lateinit var recenterFloating: MaterialButton
 
     private val http = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
@@ -72,6 +76,11 @@ class MainActivity : AppCompatActivity(), LocationListener {
     private var routeSteps = JSONArray()
     private var isNavigating = false
     private var lastWeatherFetch = 0L
+    private var followMode = true
+    private var tripStartTime = 0L
+    private var tripDistanceMeters = 0.0
+    private var lastTripLocation: Location? = null
+    private var lastRerouteAt = 0L
 
     private val permissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -96,6 +105,9 @@ class MainActivity : AppCompatActivity(), LocationListener {
         speedText = findViewById(R.id.speedText)
         startButton = findViewById(R.id.startButton)
         stopButton = findViewById(R.id.stopButton)
+        originText = findViewById(R.id.originText)
+        tripStatsText = findViewById(R.id.tripStatsText)
+        recenterFloating = findViewById(R.id.recenterFloating)
 
         map.setTileSource(TileSourceFactory.MAPNIK)
         map.setMultiTouchControls(true)
@@ -104,6 +116,14 @@ class MainActivity : AppCompatActivity(), LocationListener {
 
         findViewById<MaterialButton>(R.id.searchButton).setOnClickListener { searchAndRoute() }
         findViewById<MaterialButton>(R.id.myLocationButton).setOnClickListener { centerOnMe() }
+        recenterFloating.setOnClickListener { centerOnMe() }
+        map.setOnTouchListener { _, event ->
+            if (event.action == MotionEvent.ACTION_MOVE && isNavigating) {
+                followMode = false
+                recenterFloating.visibility = View.VISIBLE
+            }
+            false
+        }
         startButton.setOnClickListener { startNavigation() }
         stopButton.setOnClickListener { stopNavigation() }
         findViewById<MaterialButton>(R.id.reportButton).setOnClickListener { reportOccurrence() }
@@ -143,12 +163,17 @@ class MainActivity : AppCompatActivity(), LocationListener {
 
     override fun onLocationChanged(location: Location) {
         currentPoint = GeoPoint(location.latitude, location.longitude)
+        originText.text = "Minha localização • GPS ativo"
         updateCurrentMarker(currentPoint!!)
         if (lastWeatherFetch == 0L || System.currentTimeMillis() - lastWeatherFetch > 15 * 60 * 1000) {
             lastWeatherFetch = System.currentTimeMillis()
             loadWeather(currentPoint!!)
         }
-        if (isNavigating) updateNavigationUi(location)
+        if (isNavigating) {
+            recordTripPoint(location)
+            updateNavigationUi(location)
+            maybeReroute(location)
+        }
     }
 
     private fun updateCurrentMarker(point: GeoPoint) {
@@ -166,8 +191,10 @@ class MainActivity : AppCompatActivity(), LocationListener {
     private fun centerOnMe() {
         val p = currentPoint
         if (p == null) toast("Aguardando sinal de GPS...") else {
+            followMode = true
+            recenterFloating.visibility = View.GONE
             map.controller.animateTo(p)
-            map.controller.setZoom(16.0)
+            map.controller.setZoom(if (isNavigating) 17.5 else 16.0)
         }
     }
 
@@ -292,18 +319,26 @@ class MainActivity : AppCompatActivity(), LocationListener {
         }
         ContextCompat.startForegroundService(this, intent)
         isNavigating = true
+        followMode = true
+        tripStartTime = System.currentTimeMillis()
+        tripDistanceMeters = 0.0
+        lastTripLocation = null
+        recenterFloating.visibility = View.GONE
         navigationBanner.visibility = View.VISIBLE
         findViewById<View>(R.id.topPanel).visibility = View.GONE
         stopButton.visibility = View.VISIBLE
         startButton.visibility = View.GONE
-        statusText.text = "Navegação ativa em segundo plano."
+        statusText.text = "À frente • clima, postos e alertas durante o percurso"
         instructionText.text = "Rota iniciada"
         toast("SanDriv continuará orientando mesmo com outro app aberto.")
     }
 
     private fun stopNavigation() {
         startService(Intent(this, NavigationService::class.java).apply { action = NavigationService.ACTION_STOP })
+        saveTripSummary()
         isNavigating = false
+        followMode = true
+        recenterFloating.visibility = View.GONE
         navigationBanner.visibility = View.GONE
         findViewById<View>(R.id.topPanel).visibility = View.VISIBLE
         stopButton.visibility = View.GONE
@@ -324,8 +359,12 @@ class MainActivity : AppCompatActivity(), LocationListener {
         val kmh = (location.speed * 3.6f).coerceAtLeast(0f).roundToInt()
         speedText.text = "$kmh km/h"
         instructionText.text = nearestInstruction(location) ?: "Siga pela rota"
-        map.controller.animateTo(GeoPoint(location.latitude, location.longitude))
-        map.controller.setZoom(17.5)
+        val elapsed = ((System.currentTimeMillis() - tripStartTime) / 1000).coerceAtLeast(0)
+        tripStatsText.text = "Gravando • ${formatKm(tripDistanceMeters / 1000.0)} • ${elapsed / 60} min"
+        if (followMode) {
+            map.controller.animateTo(GeoPoint(location.latitude, location.longitude))
+            map.controller.setZoom(17.5)
+        }
     }
 
     private fun nearestInstruction(location: Location): String? {
@@ -351,6 +390,64 @@ class MainActivity : AppCompatActivity(), LocationListener {
         }
         val prefix = if (distance < 1000) "Em ${distance.roundToInt()} m" else "Em ${"%.1f".format(Locale.US, distance / 1000f)} km"
         return if (road.isBlank()) "$prefix, $direction" else "$prefix, $direction na $road"
+    }
+
+
+    private fun recordTripPoint(location: Location) {
+        val last = lastTripLocation
+        if (last != null) {
+            val delta = last.distanceTo(location)
+            if (delta in 1f..250f) tripDistanceMeters += delta
+        }
+        lastTripLocation = Location(location)
+    }
+
+    private fun maybeReroute(location: Location) {
+        val poly = routePolyline ?: return
+        if (System.currentTimeMillis() - lastRerouteAt < 20_000L) return
+        val here = GeoPoint(location.latitude, location.longitude)
+        val points = poly.actualPoints
+        if (points.isNullOrEmpty()) return
+        var nearest = Double.MAX_VALUE
+        for (p in points.asSequence().filterIndexed { i, _ -> i % 6 == 0 }) {
+            val r = FloatArray(1)
+            Location.distanceBetween(here.latitude, here.longitude, p.latitude, p.longitude, r)
+            if (r[0] < nearest) nearest = r[0].toDouble()
+        }
+        if (nearest > 90.0) {
+            lastRerouteAt = System.currentTimeMillis()
+            statusText.text = "Você saiu da rota • recalculando..."
+            val dest = destinationPoint ?: return
+            lifecycleScope.launch {
+                try {
+                    val route = withContext(Dispatchers.IO) { fetchRoute(here, dest) }
+                    drawRoute(route.geometry)
+                    routeDistanceMeters = route.distance
+                    routeDurationSeconds = route.duration
+                    routeSteps = route.steps
+                    statusText.text = "Nova rota pronta • continue dirigindo"
+                } catch (_: Exception) {
+                    statusText.text = "Sem conexão para recalcular • mantendo rota atual"
+                }
+            }
+        }
+    }
+
+    private fun saveTripSummary() {
+        if (tripStartTime == 0L || destinationName.isBlank()) return
+        val prefs = getSharedPreferences("trips", MODE_PRIVATE)
+        val arr = try { JSONArray(prefs.getString("items", "[]")) } catch (_: Exception) { JSONArray() }
+        arr.put(JSONObject().apply {
+            put("destination", destinationName)
+            put("startedAt", tripStartTime)
+            put("endedAt", System.currentTimeMillis())
+            put("distanceMeters", tripDistanceMeters)
+        })
+        while (arr.length() > 30) arr.remove(0)
+        prefs.edit().putString("items", arr.toString()).apply()
+        tripStatsText.text = "Viagem salva • ${formatKm(tripDistanceMeters / 1000.0)}"
+        tripStartTime = 0L
+        lastTripLocation = null
     }
 
     private fun loadWeather(point: GeoPoint) {
